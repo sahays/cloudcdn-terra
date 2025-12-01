@@ -1,0 +1,5 @@
+project_id      = "your-project-id"
+region          = "asia-south1"
+bucket_location = "asia-south1"
+bucket_name_prefix = "some-secret-bucket"
+
