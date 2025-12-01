@@ -32,15 +32,40 @@ Terraform configuration for a Google Cloud CDN serving content from a **private*
    terraform apply
    ```
 
-   Note the `cdn_ip_address` output.
+   Note the `cdn_ip_address`, `service_account_email`, and `bucket_name` outputs.
 
-3. **Generate signed URL**
+3. **Manual IAM Configuration (Required)**
+
+   Due to organization policy restrictions ("Domain Restricted Sharing"), Terraform cannot automatically grant the Cloud CDN service account access to the bucket. You must do this manually:
+
+   ```bash
+   # 1. Relax Org Policy (if "Domain Restricted Sharing" is enforced)
+   # Create policy.yaml
+   cat > policy.yaml <<EOF
+   constraint: constraints/iam.allowedPolicyMemberDomains
+   listPolicy:
+     allValues: ALLOW
+   EOF
+   gcloud resource-manager org-policies set-policy policy.yaml --project=YOUR_PROJECT_ID
+   rm policy.yaml
+
+   # 2. Grant Access
+   SA_EMAIL=$(terraform output -raw service_account_email)
+   BUCKET_NAME=$(terraform output -raw bucket_name)
+
+   gcloud storage buckets add-iam-policy-binding gs://$BUCKET_NAME \
+       --member="serviceAccount:$SA_EMAIL" \
+       --role="roles/storage.objectViewer"
+   ```
+
+4. **Generate signed URL**
+
+   Wait ~15 minutes for the CDN configuration to propagate. Then:
 
    ```bash
    ./generate_signed_url.sh http://CDN_IP index.html 3600
    ```
-
-   Replace `CDN_IP` with the output from step 2.
+   *Tip: Enclose the output URL in single quotes when using `curl`.*
 
 ## Key Design Decisions
 
