@@ -94,22 +94,27 @@ resource "google_compute_backend_bucket_signed_url_key" "cdn_key" {
   key_value      = random_id.url_signature.b64_url
 }
 
+# Wait for Backend Bucket to be fully ready before attaching to URL Map
+resource "time_sleep" "wait_for_backend_bucket" {
+  depends_on = [google_compute_backend_bucket.cdn_backend]
+  create_duration = "30s"
+}
+
 # 4. Wait Timer (To solve the race condition)
 # The cloud-cdn-fill service account is created when the signed URL key is added
 resource "time_sleep" "wait_for_service_account" {
   depends_on = [google_compute_backend_bucket_signed_url_key.cdn_key]
-  create_duration = "60s"
+  create_duration = "120s"
 }
 
-# 5. Grant Access
-resource "google_storage_bucket_iam_member" "cdn_access" {
-  bucket = google_storage_bucket.cdn_bucket.name
-  role   = "roles/storage.objectViewer"
+# 5. Grant Access - MANUAL STEP REQUIRED
+# Due to "Domain Restricted Sharing" organization policies, we skip the automated
+# IAM binding. You must manually grant 'roles/storage.objectViewer' to the
+# service account displayed in the outputs.
 
-  # Use the service account email from locals
-  member = "serviceAccount:${local.cloud_cdn_service_account}"
-
-  depends_on = [time_sleep.wait_for_service_account]
+output "service_account_email" {
+  value       = local.cloud_cdn_service_account
+  description = "The Cloud CDN service account that needs access to the bucket."
 }
 
 # --- Load Balancer Components ---
@@ -122,6 +127,7 @@ resource "google_compute_global_address" "cdn_ip" {
 resource "google_compute_url_map" "cdn_url_map" {
   name            = "${var.lb_name_prefix}-url-map"
   default_service = google_compute_backend_bucket.cdn_backend.id
+  depends_on      = [time_sleep.wait_for_backend_bucket]
 }
 
 resource "google_compute_target_http_proxy" "cdn_proxy" {
