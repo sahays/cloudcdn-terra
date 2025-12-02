@@ -88,7 +88,7 @@ resource "google_compute_global_network_endpoint_group" "gcs_neg" {
 
 resource "google_compute_global_network_endpoint" "gcs_endpoint" {
   global_network_endpoint_group = google_compute_global_network_endpoint_group.gcs_neg.id
-  fqdn                          = "storage.googleapis.com"
+  fqdn                          = "${google_storage_bucket.cdn_bucket.name}.storage.googleapis.com"
   port                          = 443
 }
 
@@ -105,13 +105,12 @@ resource "google_compute_backend_service" "cdn_backend" {
   }
 
   cdn_policy {
-    cache_mode                  = "FORCE_CACHE_ALL"
-    default_ttl                 = 3600
-    max_ttl                     = 86400
-    client_ttl                  = 7200
-    negative_caching            = true
-    serve_while_stale           = 86400
-    signed_url_cache_max_age_sec = 3600 # Required for signed URLs
+    cache_mode                   = "FORCE_CACHE_ALL"
+    default_ttl                  = 3600
+    client_ttl                   = 7200
+    negative_caching             = true
+    serve_while_stale            = 86400
+    signed_url_cache_max_age_sec = 3600
   }
 
   custom_request_headers = [

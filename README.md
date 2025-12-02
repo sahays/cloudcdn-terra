@@ -1,12 +1,13 @@
 # CDN with Private GCS Bucket
 
-Terraform configuration for a Google Cloud CDN serving content from a **private** Cloud Storage bucket using signed URLs for access control.
+Terraform configuration for a Google Cloud CDN serving content from a **private** Cloud Storage bucket using HMAC-based private origin authentication.
 
 ## What It Does
 
 - Creates a private GCS bucket with public access prevention enforced
 - Sets up Cloud CDN with a global HTTP load balancer
-- Configures signed URL authentication for secure content delivery
+- Uses HMAC keys with AWS V4 signature authentication for private origin access
+- No client-side authentication required - CDN handles it transparently
 - Uploads sample `index.html` to the bucket
 
 ## Prerequisites
@@ -14,7 +15,6 @@ Terraform configuration for a Google Cloud CDN serving content from a **private*
 - Google Cloud project with billing enabled
 - Terraform >= 1.0
 - `gcloud` CLI authenticated
-- `openssl` for generating signed URLs
 
 ## Setup
 
@@ -32,48 +32,27 @@ Terraform configuration for a Google Cloud CDN serving content from a **private*
    terraform apply
    ```
 
-   Note the `cdn_ip_address`, `service_account_email`, and `bucket_name` outputs.
+   Note the `cdn_ip_address` and `bucket_name` outputs.
 
-3. **Manual IAM Configuration (Required)**
+3. **Test access**
 
-   Due to organization policy restrictions ("Domain Restricted Sharing"), Terraform cannot automatically grant the Cloud CDN service account access to the bucket. You must do this manually:
-
-   ```bash
-   # 1. Relax Org Policy (if "Domain Restricted Sharing" is enforced)
-   # Create policy.yaml
-   cat > policy.yaml <<EOF
-   constraint: constraints/iam.allowedPolicyMemberDomains
-   listPolicy:
-     allValues: ALLOW
-   EOF
-   gcloud resource-manager org-policies set-policy policy.yaml --project=YOUR_PROJECT_ID
-   rm policy.yaml
-
-   # 2. Grant Access
-   SA_EMAIL=$(terraform output -raw service_account_email)
-   BUCKET_NAME=$(terraform output -raw bucket_name)
-
-   gcloud storage buckets add-iam-policy-binding gs://$BUCKET_NAME \
-       --member="serviceAccount:$SA_EMAIL" \
-       --role="roles/storage.objectViewer"
-   ```
-
-4. **Generate signed URL**
-
-   Wait ~15 minutes for the CDN configuration to propagate. Then:
+   Wait 5-10 minutes for the CDN to propagate globally, then:
 
    ```bash
-   ./generate_signed_url.sh http://CDN_IP index.html 3600
+   curl http://CDN_IP/index.html
    ```
-   *Tip: Enclose the output URL in single quotes when using `curl`.*
+
+   No signed URLs needed - the CDN handles authentication automatically.
 
 ## Key Design Decisions
 
-**Private bucket with signed URLs**: Ensures content isn't publicly accessible. Only users with valid signed URLs can access objects, providing time-limited, cryptographically secure access control.
+**HMAC-based private origin authentication**: CDN uses HMAC keys to sign requests to GCS using AWS V4 signatures. The bucket stays private while CDN has transparent access. No signed URLs or client-side authentication needed.
 
-**60-second wait timer** (main.tf:99-102): Solves race condition where the `cloud-cdn-fill` service account is created asynchronously after adding a signed URL key. Without this, IAM binding fails.
+**Internet NEG with bucket-specific FQDN** (main.tf:91): The NEG endpoint must use `{bucket-name}.storage.googleapis.com`, not just `storage.googleapis.com`. This matches the Host header and ensures proper routing to the private bucket.
 
-**Uniform bucket-level access**: Simplifies permissions management by enforcing consistent access control across all objects.
+**`FORCE_CACHE_ALL` without `max_ttl`** (main.tf:108): Google Cloud CDN requires omitting `max_ttl` when using `FORCE_CACHE_ALL` mode. The `max_ttl` parameter only applies to `CACHE_ALL_STATIC` mode which respects origin cache headers.
+
+**Backend service (not backend bucket)**: Private origin authentication requires an Internet NEG backend service instead of a backend bucket. This incurs additional egress charges on cache misses but enables private bucket access.
 
 **Project number suffix on bucket name**: Guarantees global uniqueness since bucket names share a global namespace.
 
@@ -81,7 +60,6 @@ Terraform configuration for a Google Cloud CDN serving content from a **private*
 
 - `main.tf` - Infrastructure definition
 - `variables.tf` - Configurable parameters
-- `generate_signed_url.sh` - Helper to create signed URLs
 - `index.html` - Sample content
 
 ## Clean Up
