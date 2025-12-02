@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/google"
       version = "~> 7.12"
     }
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "~> 7.12"
+    }
     random = {
       source  = "hashicorp/random"
       version = "~> 3.6"
@@ -24,15 +28,14 @@ provider "google" {
   region  = var.region
 }
 
-# Get Project Details (specifically Project Number for the Service Account)
-data "google_project" "project" {
-  project_id = var.project_id
+provider "google-beta" {
+  project = var.project_id
+  region  = var.region
 }
 
-locals {
-  # The Cloud CDN "Fill" service account is created automatically but asynchronously.
-  # We construct the email here to keep the resource block clean.
-  cloud_cdn_service_account = "service-${data.google_project.project.number}@cloud-cdn-fill.iam.gserviceaccount.com"
+# Get Project Details
+data "google_project" "project" {
+  project_id = var.project_id
 }
 
 # 1. Create the Bucket
@@ -58,63 +61,74 @@ resource "google_storage_bucket_object" "index_page" {
   cache_control = "public, max-age=3600"
 }
 
-resource "google_project_service" "compute_api" {
-  project = var.project_id
-  service = "compute.googleapis.com"
-  # Do not disable the service on destroy. This avoids issues if other resources also depend on it.
-  disable_on_destroy = false
+# 3. Create Service Account for CDN Access
+resource "google_service_account" "cdn_sa" {
+  account_id   = "cdn-access-sa"
+  display_name = "Service Account for CDN Private Bucket Access"
 }
 
-# 3. Create the Backend Bucket
-resource "google_compute_backend_bucket" "cdn_backend" {
-  depends_on  = [google_project_service.compute_api]
-  name        = "${var.lb_name_prefix}-backend-bucket"
-  bucket_name = google_storage_bucket.cdn_bucket.name
-  enable_cdn  = true
+# 4. Grant Access to the Service Account
+resource "google_storage_bucket_iam_member" "cdn_access" {
+  bucket = google_storage_bucket.cdn_bucket.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cdn_sa.email}"
+}
+
+# 5. Generate HMAC Keys for the Service Account
+resource "google_storage_hmac_key" "cdn_hmac_key" {
+  service_account_email = google_service_account.cdn_sa.email
+}
+
+# 6. Create Internet NEG pointing to GCS
+resource "google_compute_global_network_endpoint_group" "gcs_neg" {
+  name                  = "${var.lb_name_prefix}-gcs-neg"
+  network_endpoint_type = "INTERNET_FQDN_PORT"
+  default_port          = 443
+}
+
+resource "google_compute_global_network_endpoint" "gcs_endpoint" {
+  global_network_endpoint_group = google_compute_global_network_endpoint_group.gcs_neg.id
+  fqdn                          = "storage.googleapis.com"
+  port                          = 443
+}
+
+# 7. Create Backend Service with Private Origin Authentication
+resource "google_compute_backend_service" "cdn_backend" {
+  provider              = google-beta
+  name                  = "${var.lb_name_prefix}-backend-service"
+  load_balancing_scheme = "EXTERNAL"
+  protocol              = "HTTPS"
+  enable_cdn            = true
+
+  backend {
+    group = google_compute_global_network_endpoint_group.gcs_neg.id
+  }
 
   cdn_policy {
-    cache_mode        = "CACHE_ALL_STATIC"
-    default_ttl       = 3600
-    max_ttl           = 86400
-    client_ttl        = 7200
-    negative_caching  = true
-    serve_while_stale = 86400
+    cache_mode                  = "FORCE_CACHE_ALL"
+    default_ttl                 = 3600
+    max_ttl                     = 86400
+    client_ttl                  = 7200
+    negative_caching            = true
+    serve_while_stale           = 86400
+    signed_url_cache_max_age_sec = 3600 # Required for signed URLs
   }
-}
 
-# 3a. Generate Random Key for Signed URLs
-resource "random_id" "url_signature" {
-  byte_length = 16
-}
+  custom_request_headers = [
+    "Host: ${google_storage_bucket.cdn_bucket.name}.storage.googleapis.com"
+  ]
 
-# 3b. Create Signed URL Key (This triggers creation of cloud-cdn-fill service account)
-resource "google_compute_backend_bucket_signed_url_key" "cdn_key" {
-  name           = "cdn-signing-key"
-  backend_bucket = google_compute_backend_bucket.cdn_backend.name
-  key_value      = random_id.url_signature.b64_url
-}
+  security_settings {
+    aws_v4_authentication {
+      access_key_id = google_storage_hmac_key.cdn_hmac_key.access_id
+      access_key    = google_storage_hmac_key.cdn_hmac_key.secret
+      origin_region = var.bucket_location
+    }
+  }
 
-# Wait for Backend Bucket to be fully ready before attaching to URL Map
-resource "time_sleep" "wait_for_backend_bucket" {
-  depends_on = [google_compute_backend_bucket.cdn_backend]
-  create_duration = "30s"
-}
-
-# 4. Wait Timer (To solve the race condition)
-# The cloud-cdn-fill service account is created when the signed URL key is added
-resource "time_sleep" "wait_for_service_account" {
-  depends_on = [google_compute_backend_bucket_signed_url_key.cdn_key]
-  create_duration = "120s"
-}
-
-# 5. Grant Access - MANUAL STEP REQUIRED
-# Due to "Domain Restricted Sharing" organization policies, we skip the automated
-# IAM binding. You must manually grant 'roles/storage.objectViewer' to the
-# service account displayed in the outputs.
-
-output "service_account_email" {
-  value       = local.cloud_cdn_service_account
-  description = "The Cloud CDN service account that needs access to the bucket."
+  depends_on = [
+    google_compute_global_network_endpoint.gcs_endpoint
+  ]
 }
 
 # --- Load Balancer Components ---
@@ -126,8 +140,7 @@ resource "google_compute_global_address" "cdn_ip" {
 
 resource "google_compute_url_map" "cdn_url_map" {
   name            = "${var.lb_name_prefix}-url-map"
-  default_service = google_compute_backend_bucket.cdn_backend.id
-  depends_on      = [time_sleep.wait_for_backend_bucket]
+  default_service = google_compute_backend_service.cdn_backend.id
 }
 
 resource "google_compute_target_http_proxy" "cdn_proxy" {
@@ -151,15 +164,3 @@ output "bucket_name" {
   value       = google_storage_bucket.cdn_bucket.name
   description = "The name of the created GCS bucket"
 }
-
-output "signing_key_name" {
-  value       = google_compute_backend_bucket_signed_url_key.cdn_key.name
-  description = "The name of the signing key for generating signed URLs"
-}
-
-output "signing_key_value" {
-  value       = random_id.url_signature.b64_url
-  description = "The base64-encoded signing key value (keep secret!)"
-  sensitive   = true
-}
-
